@@ -16,6 +16,9 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing_extensions import Annotated
 from typing import Union
+from motor.motor_asyncio import AsyncIOMotorClient
+import json
+import cv2
 
 
 app = FastAPI()
@@ -28,7 +31,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL = tf.keras.models.load_model("C:\\Users\\USER\\Desktop\\vgg model")
+
+MODEL = tf.keras.models.load_model(
+    "C:\\Users\\USER\\Desktop\\vgg model")
+
+# MODEL = tf.keras.models.load_model(
+#     "D:\Project works and models\Model2\VGG16_fine_tuned_10")
 CLASS_NAMES = ['Tomato_Bacterial_spot',
                'Tomato_Early_blight',
                'Tomato_Late_blight',
@@ -89,6 +97,14 @@ WHERE {
     return query
 
 
+def is_blurry(image, threshold=100):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Compute the Laplacian
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    print(laplacian_var)
+    return laplacian_var < threshold
+
+
 @app.get("/ping")
 async def ping():
     return "Hello, I am alive"
@@ -96,115 +112,258 @@ async def ping():
 
 def read_file_as_image(data, target_size=(224, 224)) -> np.ndarray:
     image = Image.open(BytesIO(data))
+
     # Resize the image
     resized_image = tf.image.resize(np.array(image), target_size)
     print(resized_image.shape)
     return resized_image
 
 
-@app.post("/image_upload")
-async def predict(
-    file: UploadFile = File(...),
-):
+class PredictionFacade:
+    def __init__(self, model_path, ontology_url):
+        self.model = tf.keras.models.load_model(model_path)
+        self.class_names = ['Tomato_Bacterial_spot', 'Tomato_Early_blight', 'Tomato_Late_blight', 'Tomato_Leaf_Mold',
+                            'Tomato_Septoria_leaf_spot', 'Tomato_Spider_mites_Two_spotted_spider_mite',
+                            'Tomato__Black_mold', 'Tomato__Gray_spot', 'Tomato__Target_Spot',
+                            'Tomato__Tomato_YellowLeaf__Curl_Virus', 'Tomato__Tomato_mosaic_virus',
+                            'Tomato__powdery_mildew', 'Tomato_healthy']
+        self.disease_mapping = {
+            "Tomato_Bacterial_spot": "bacterial_spot",
+            "Tomato_Early_blight": "early_blight",
+            "Tomato_Late_blight": "late_blight",
+            "Tomato_Leaf_Mold": "leaf_mold",
+            "Tomato_Septoria_leaf_spot": "septoria_leaf_spot",
+            "Tomato_Spider_mites_Two_spotted_spider_mite": "spider_mites",
+            "Tomato__Black_mold": "black_mold",
+            "Tomato__Gray_spot": "gray_spot",
+            "Tomato__Target_Spot": "target_spot",
+            "Tomato__Tomato_YellowLeaf__Curl_Virus": "yellow_leaf_curl",
+            "Tomato__Tomato_mosaic_virus": "mosaic_virus",
+            "Tomato__powdery_mildew": "powdery_mildew",
+            "Tomato_healthy": "healthy"
+        }
+        self.ontology_url = ontology_url
 
-    image = await file.read()
-    image = Image.open(BytesIO(image))
-    resized_image = tf.image.resize(np.array(image), (224, 224))
-    img_batch = np.expand_dims(resized_image, 0)
-    predictions = MODEL.predict(img_batch)
-    confidence_threshold = 0.0
-    class_confidence_map = dict(zip(CLASS_NAMES, predictions[0]))
-    filtered_diseases = [disease for disease,
-                         confidence in class_confidence_map.items() if confidence >= confidence_threshold]
-    Deep_Model_Sorted_Disease = sorted(
-        filtered_diseases, key=lambda x: class_confidence_map[x], reverse=True)
+    def process_image(self, file):
+        image = Image.open(BytesIO(file))
+        resized_image = tf.image.resize(np.array(image), (224, 224))
 
-    github_raw_uri = "https://raw.githubusercontent.com/mtbstn24/OntoML/main/OntoMLv3.rdf"
+        image_np = np.array(resized_image)
+        # if len(image_np.shape) > 2 and image_np.shape[2] == 4:
+        #     # convert the image from RGBA2RGB
+        #     image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2BGR)
+        # print(image_np.shape)
+        image_np_uint8 = image_np.astype(np.uint8)
 
-    # Fetch the RDF file from the GitHub repository
-    response = requests.get(github_raw_uri)
+        if self.is_blurry(image_np_uint8):
+            return {"disease": "Image is Blurry"}
 
-    if response.status_code == 200:
-        # Create a Graph
-        g = Graph()
-        g.parse(data=response.text, format="application/rdf+xml")
+        img_batch = np.expand_dims(resized_image, 0)
+        predictions = self.model.predict(img_batch)
+        confidence_threshold = 0.0
+        class_confidence_map = dict(zip(self.class_names, predictions[0]))
+        filtered_diseases = [disease for disease,
+                             confidence in class_confidence_map.items() if confidence >= confidence_threshold]
+        deep_model_sorted_disease = sorted(
+            filtered_diseases, key=lambda x: class_confidence_map[x], reverse=True)
 
-        query = build_sparql_query(EXTRA_SYMPTOMS)
+        ontology_satisfying_diseases = self.query_ontology()
 
-        # Execute the SPARQL query
-        results = g.query(query)
+        output_disease = self.match_disease(
+            deep_model_sorted_disease, ontology_satisfying_diseases)
 
-        ontology_satisfying_diseases = []
+        return {"disease": output_disease}
 
-        for row in results:
-            disease = row.diseaseName
-            ontology_satisfying_diseases.append(disease.value)
+    def is_blurry(self, image, threshold=50):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return laplacian_var < threshold
 
-        print("Ontology disease")
+    def query_ontology(self):
+        response = requests.get(self.ontology_url)
+        if response.status_code == 200:
+            g = Graph()
+            g.parse(data=response.text, format="application/rdf+xml")
+            results = g.query(build_sparql_query(EXTRA_SYMPTOMS))
+            ontology_satisfying_diseases = [
+                row.diseaseName.value for row in results]
+            return ontology_satisfying_diseases
+        else:
+            raise Exception("Failed to fetch ontology information")
 
-        print(ontology_satisfying_diseases)
-
-        found = False
+    def match_disease(self, deep_model_sorted_disease, ontology_satisfying_diseases):
         output_disease = "Not found"
+        if not deep_model_sorted_disease:
+            return output_disease
+
         if len(ontology_satisfying_diseases) == 0:
-            output_disease = Deep_Model_Sorted_Disease[0]
+            output_disease = deep_model_sorted_disease[0]
         elif len(ontology_satisfying_diseases) == 1:
             output_disease = ontology_satisfying_diseases[0]
-        elif len(ontology_satisfying_diseases) == 0 and len(Deep_Model_Sorted_Disease) == 0:
-            print("Couldn't find the disease with given information")
         else:
-
-            for deep_disease in Deep_Model_Sorted_Disease:
+            for deep_disease in deep_model_sorted_disease:
                 for onto_disease in ontology_satisfying_diseases:
-                    print(deep_disease)
-                    print(onto_disease)
-                    if disease_mapping[deep_disease] == onto_disease:
+                    if self.disease_mapping.get(deep_disease) == onto_disease:
                         output_disease = deep_disease
-                        found = True
-                        break
-                if found:
-                    break
+                        return output_disease
+        return output_disease
 
-    else:
-        print("Failed to fetch ontology information")
+    def detect_ontology(self):
+        response = requests.get(self.ontology_url)
+        if response.status_code == 200:
+            g = Graph()
+            g.parse(data=response.text, format="application/rdf+xml")
+            results = g.query(build_sparql_query(EXTRA_SYMPTOMS))
+            ontology_satisfying_diseases = [
+                row.diseaseName.value for row in results]
+            return {"disease": ontology_satisfying_diseases}
+        else:
+            raise Exception("Failed to fetch ontology information")
 
-    return {
-        "disease": output_disease,
-    }
+
+# C:\\Users\\USER\\Desktop\\vgg model
+
+@app.post("/image_upload")
+async def predict(file: UploadFile = File(...)):
+    facade = PredictionFacade("C:\\Users\\USER\\Desktop\\vgg model",
+                              "https://raw.githubusercontent.com/Sribarathvajasarma/Plant_disease_ontology_2/main/OntoMLv3.rdf")
+    result = facade.process_image(await file.read())
+    return result
+
+
+# https://raw.githubusercontent.com/mtbstn24/OntoML/main/OntoMLv3.rdf
 
 
 @app.get("/ontology_detection")
 async def predict_ontology():
+    facade = PredictionFacade("C:\\Users\\USER\\Desktop\\vgg model",
+                              "https://raw.githubusercontent.com/Sribarathvajasarma/Plant_disease_ontology_2/main/OntoMLv3.rdf")
+    result = facade.detect_ontology()
+    return result
 
-    github_raw_uri = "https://raw.githubusercontent.com/mtbstn24/OntoML/main/OntoMLv3.rdf"
 
-    # Fetch the RDF file from the GitHub repository
-    response = requests.get(github_raw_uri)
+# @app.post("/image_upload")
+# async def predict(
+#     file: UploadFile = File(...),
+# ):
 
-    if response.status_code == 200:
-        # Create a Graph
-        g = Graph()
-        g.parse(data=response.text, format="application/rdf+xml")
+#     image = await file.read()
+#     image = Image.open(BytesIO(image))
+#     resized_image = tf.image.resize(np.array(image), (224, 224))
 
-        query = build_sparql_query(EXTRA_SYMPTOMS)
+#     image_np = np.array(resized_image)
+#     image_np_uint8 = image_np.astype(np.uint8)
 
-        # Execute the SPARQL query
-        results = g.query(query)
+#     # EXTRA_SYMPTOMS = {
+#     #     "hasLeafSymptom": "lesions",
+#     #     "hasLeafSymptomColour": "yellow",
+#     # }
 
-        ontology_satisfying_diseases = []
+#     if is_blurry(image_np_uint8):
+#         return {
+#             "error": "Image is Blurry",
+#         }
 
-        for row in results:
-            disease = row.diseaseName
-            ontology_satisfying_diseases.append(disease.value)
+#     img_batch = np.expand_dims(resized_image, 0)
+#     predictions = MODEL.predict(img_batch)
+#     confidence_threshold = 0.0
+#     class_confidence_map = dict(zip(CLASS_NAMES, predictions[0]))
+#     filtered_diseases = [disease for disease,
+#                          confidence in class_confidence_map.items() if confidence >= confidence_threshold]
+#     Deep_Model_Sorted_Disease = sorted(
+#         filtered_diseases, key=lambda x: class_confidence_map[x], reverse=True)
 
-        print(ontology_satisfying_diseases)
+#     github_raw_uri = "https://raw.githubusercontent.com/mtbstn24/OntoML/main/OntoMLv3.rdf"
 
-    else:
-        print("Failed to fetch ontology information")
+#     # Fetch the RDF file from the GitHub repository
+#     response = requests.get(github_raw_uri)
 
-    return {
-        "disease": ontology_satisfying_diseases,
-    }
+#     if response.status_code == 200:
+#         # Create a Graph
+#         g = Graph()
+#         g.parse(data=response.text, format="application/rdf+xml")
+
+#         query = build_sparql_query(EXTRA_SYMPTOMS)
+
+#         # Execute the SPARQL query
+#         results = g.query(query)
+
+#         ontology_satisfying_diseases = []
+
+#         for row in results:
+#             disease = row.diseaseName
+#             ontology_satisfying_diseases.append(disease.value)
+
+#         print("Ontology disease")
+
+#         print(ontology_satisfying_diseases)
+
+#         found = False
+#         output_disease = "Not found"
+#         if len(ontology_satisfying_diseases) == 0:
+#             output_disease = Deep_Model_Sorted_Disease[0]
+#         elif len(ontology_satisfying_diseases) == 1:
+#             output_disease = ontology_satisfying_diseases[0]
+#         elif len(ontology_satisfying_diseases) == 0 and len(Deep_Model_Sorted_Disease) == 0:
+#             print("Couldn't find the disease with given information")
+#         else:
+
+#             for deep_disease in Deep_Model_Sorted_Disease:
+#                 for onto_disease in ontology_satisfying_diseases:
+#                     print(deep_disease)
+#                     print(onto_disease)
+#                     if disease_mapping[deep_disease] == onto_disease:
+#                         output_disease = deep_disease
+#                         found = True
+#                         break
+#                 if found:
+#                     break
+
+#     else:
+#         print("Failed to fetch ontology information")
+
+#     return {
+#         "disease": output_disease,
+#     }
+
+
+# @app.get("/ontology_detection")
+# async def predict_ontology():
+
+#     # payload = {
+#     #     "hasLeafSymptom": "lesions",
+#     #     "hasLeafSymptomColour": "yellow",
+#     # }
+
+#     github_raw_uri = "https://raw.githubusercontent.com/mtbstn24/OntoML/main/OntoMLv3.rdf"
+
+#     # Fetch the RDF file from the GitHub repository
+#     response = requests.get(github_raw_uri)
+
+#     if response.status_code == 200:
+#         # Create a Graph
+#         g = Graph()
+#         g.parse(data=response.text, format="application/rdf+xml")
+
+#         query = build_sparql_query(EXTRA_SYMPTOMS)
+
+#         # Execute the SPARQL query
+#         results = g.query(query)
+
+#         ontology_satisfying_diseases = []
+
+#         for row in results:
+#             disease = row.diseaseName
+#             ontology_satisfying_diseases.append(disease.value)
+
+#         print(ontology_satisfying_diseases)
+
+#     else:
+#         print("Failed to fetch ontology information")
+
+#     return {
+#         "disease": ontology_satisfying_diseases,
+#     }
 
 
 @app.post("/extra_symptoms")
@@ -213,6 +372,7 @@ async def predict(
 ):
     global EXTRA_SYMPTOMS
     EXTRA_SYMPTOMS = payload
+    print(EXTRA_SYMPTOMS)
     return{
         "message": "Data received successfully"
     }
@@ -237,148 +397,6 @@ async def predict_image(
     return{
         "disease": predicted_class,
     }
-
-
-# if __name__ == "__main__":
-#     uvicorn.run(app, host='localhost', port=8000)
-
-
-# to get a string like this run:
-# openssl rand -hex 32
-SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-
-fake_users_db = {
-    "johndoe": {
-        "username": "johndoe",
-        "full_name": "John Doe",
-        "email": "johndoe@example.com",
-        "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",
-        "disabled": False,
-    }
-}
-
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-
-class TokenData(BaseModel):
-    username: Union[str, None] = None
-
-
-class User(BaseModel):
-    username: str
-    email: Union[str, None] = None
-    full_name: Union[str, None] = None
-    disabled: Union[bool, None] = None
-
-
-class UserInDB(User):
-    hashed_password: str
-
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
-
-
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
-    if not user:
-        return False
-    if not verify_password(password, user.hashed_password):
-        return False
-    return user
-
-
-def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError:
-        raise credentials_exception
-    user = get_user(fake_users_db, username=token_data.username)
-    if user is None:
-        raise credentials_exception
-    return user
-
-
-async def get_current_active_user(
-    current_user: Annotated[User, Depends(get_current_user)]
-):
-    if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user
-
-
-@app.post("/token", response_model=Token)
-async def login_for_access_token(
-    form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
-):
-    user = authenticate_user(
-        fake_users_db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
-
-
-@app.get("/users/me/", response_model=User)
-async def read_users_me(
-    current_user: Annotated[User, Depends(get_current_active_user)]
-):
-    return current_user
-
-
-@app.get("/users/me/items/")
-async def read_own_items(
-    current_user: Annotated[User, Depends(get_current_active_user)]
-):
-    return [{"item_id": "Foo", "owner": current_user.username}]
 
 
 if __name__ == "__main__":
