@@ -515,6 +515,10 @@ async def detect_leaves_symptoms(file: UploadFile = File(...)):
     
     results = MODEL_YOLOV8_LSD.predict(source=image, task='detect', conf=0.35, save=False)
     boundingbox_image, symptoms_detected = apply_bounding_boxes(image, results, MODEL_YOLOV8_LSD.names)
+    if(len(symptoms_detected) == 0):
+        results = MODEL_YOLOV8_LSD.predict(source=image, task='detect', conf=0.2, save=False)
+        boundingbox_image, symptoms_detected = apply_bounding_boxes(image, results, MODEL_YOLOV8_LSD.names)
+    
     cv2.imwrite("./detect.png", boundingbox_image)
 
     # Remove underscores from strings and get unique items
@@ -574,18 +578,18 @@ def apply_segmentation_mask(img, results, names):
                 # get box coordinates in (left, top, right, bottom) format
                 x1, y1, x2, y2 = box.xyxy.tolist()[0]
                 
-                # Ploat the rectangle around the detected object
-                cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                # # Ploat the rectangle around the detected object
+                # cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
-                # text to the rectangle
-                text = class_name
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 1.5
-                thickness = 4
-                text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
-                text_x = int(x1 + 5)
-                text_y = int(y1 + text_size[1] + 5)
-                cv2.putText(img, text, (text_x, text_y), font, font_scale, (0, 0, 255), thickness)
+                # # text to the rectangle
+                # text = class_name
+                # font = cv2.FONT_HERSHEY_SIMPLEX
+                # font_scale = 1.5
+                # thickness = 4
+                # text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
+                # text_x = int(x1 + 5)
+                # text_y = int(y1 + text_size[1] + 5)
+                # cv2.putText(img, text, (text_x, text_y), font, font_scale, (0, 0, 255), thickness)
 
                 # SAM Model
                 predictor = SamPredictor(MODEL_SAM)
