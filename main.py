@@ -46,7 +46,7 @@ model_path_yolov8_lsd = os.path.join(parent_dir, "saved_models", "yolov8lsd_mode
 model_path_yolov8_dld = os.path.join(parent_dir, "saved_models", "yolov8dld_model", "best.pt")
 model_path_sam = os.path.join(parent_dir, "saved_models", "sam_model", "sam_vit_h_4b8939.pth")
 model_path_yolov8_dls = os.path.join(parent_dir, "saved_models", "yolov8dls_model", "best.pt")
-model_ontology = os.path.join(parent_dir, "ontology_file", "OntoMLv3.rdf")
+model_ontology = os.path.join(parent_dir, "ontology_file", "OntoMLv4.rdf")
 
 MODEL = tf.keras.models.load_model(
     model_path_vgg16
@@ -241,14 +241,14 @@ class PredictionFacade:
             return output_disease
 
         if len(ontology_satisfying_diseases) == 0:
-            output_disease = deep_model_sorted_disease[0]
+            output_disease = self.disease_mapping(deep_model_sorted_disease[0])
         elif len(ontology_satisfying_diseases) == 1:
             output_disease = ontology_satisfying_diseases[0]
         else:
             for deep_disease in deep_model_sorted_disease:
                 for onto_disease in ontology_satisfying_diseases:
                     if self.disease_mapping.get(deep_disease) == onto_disease:
-                        output_disease = deep_disease
+                        output_disease = self.disease_mapping.get(deep_disease)
                         return output_disease
         return output_disease
 
